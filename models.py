@@ -1,8 +1,12 @@
 import torch
+import torch.nn.functional as F
+from torch_geometric.nn import GCNConv
 from torch_geometric.nn.inits import reset
 from torch_geometric.nn import InnerProductDecoder
+from torch_geometric.utils import negative_sampling, remove_self_loops, add_self_loops
 
 MAX_LOGSTD = 10
+EPS = 1e-15
 
 class GAE(torch.nn.Module):
     """The Graph Auto-Encoder model from the
@@ -28,10 +32,12 @@ class GAE(torch.nn.Module):
 
 
     def encode(self, *args, **kwargs):
+        """Runs the encoder and computes node-wise latent variables."""
         return self.encoder(*args, **kwargs)
 
 
     def decode(self, *args, **kwargs):
+        """Runs the decoder and computes edge probabilities."""
         return self.decoder(*args, **kwargs)
 
 
@@ -61,32 +67,6 @@ class GAE(torch.nn.Module):
                               EPS).mean()
 
         return pos_loss + neg_loss
-
-
-    def test(self, z, pos_edge_index, neg_edge_index):
-        """Given latent variables :obj:`z`, positive edges
-        :obj:`pos_edge_index` and negative edges :obj:`neg_edge_index`,
-        computes area under the ROC curve (AUC) and average precision (AP)
-        scores.
-
-        Args:
-            z (Tensor): The latent space :math:`\mathbf{Z}`.
-            pos_edge_index (LongTensor): The positive edges to evaluate
-                against.
-            neg_edge_index (LongTensor): The negative edges to evaluate
-                against.
-        """
-        pos_y = z.new_ones(pos_edge_index.size(1))
-        neg_y = z.new_zeros(neg_edge_index.size(1))
-        y = torch.cat([pos_y, neg_y], dim=0)
-
-        pos_pred = self.decoder(z, pos_edge_index, sigmoid=True)
-        neg_pred = self.decoder(z, neg_edge_index, sigmoid=True)
-        pred = torch.cat([pos_pred, neg_pred], dim=0)
-
-        y, pred = y.detach().cpu().numpy(), pred.detach().cpu().numpy()
-
-        return roc_auc_score(y, pred), average_precision_score(y, pred)
 
 
 class VGAE(GAE):
@@ -135,3 +115,24 @@ class VGAE(GAE):
         mu = self.__mu__ if mu is None else mu
         logstd = self.__logstd__ if logstd is None else logstd.clamp(max=MAX_LOGSTD)
         return -0.5 * torch.mean(torch.sum(1 + 2 * logstd - mu**2 - logstd.exp()**2, dim=1))
+
+
+class GCNEncoder(torch.nn.Module):
+    def __init__(self, dims, dropout):
+        super(GCNEncoder, self).__init__()
+        self.dropout = dropout
+        self.layers = torch.nn.ModuleList()
+        for i in range(len(dims) - 1):
+            conv = GCNConv(dims[i], dims[i + 1], cached=True)  # cached only for transductive
+            self.layers.append(conv)
+
+    def forward(self, x, edge_index):
+        num_layers = len(self.layers)
+        for idx, layer in enumerate(self.layers):
+            if idx < num_layers - 1:
+                x = layer(x, edge_index)
+                x = F.relu(x)
+                x = F.dropout(x, p=self.dropout, training=self.training)
+            else:
+                x = layer(x, edge_index)
+        return x
